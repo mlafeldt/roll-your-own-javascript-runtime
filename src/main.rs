@@ -1,57 +1,65 @@
-use deno_core::op;
-use deno_core::Extension;
-use deno_core::error::AnyError;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
-#[op]
-async fn op_read_file(path: String) -> Result<String, AnyError> {
-    let contents = tokio::fs::read_to_string(path).await?;
-    Ok(contents)
-}
+use deno_runtime::{
+    deno_core::{error::AnyError, resolve_path, FsModuleLoader, ModuleSpecifier},
+    permissions::{Permissions, PermissionsOptions},
+    worker::{MainWorker, WorkerOptions},
+    BootstrapOptions,
+};
 
-#[op]
-async fn op_write_file(path: String, contents: String) -> Result<(), AnyError> {
-    tokio::fs::write(path, contents).await?;
-    Ok(())
-}
+#[tokio::main]
+async fn main() -> Result<(), AnyError> {
+    let main_module = resolve_path("example.js")?;
 
-#[op]
-fn op_remove_file(path: String) -> Result<(), AnyError> {
-    std::fs::remove_file(path)?;
-    Ok(())
-}
-
-async fn run_js(file_path: &str) -> Result<(), AnyError> {
-    let main_module = deno_core::resolve_path(file_path)?;
-    let runjs_extension = Extension::builder()
-        .ops(vec![
-            op_read_file::decl(),
-            op_write_file::decl(),
-            op_remove_file::decl(),
-        ])
-        .build();
-    let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-        module_loader: Some(Rc::new(deno_core::FsModuleLoader)),
-        extensions: vec![runjs_extension],
+    let allowlist = vec![PathBuf::from("log.txt")];
+    let permissions = Permissions::from_options(&PermissionsOptions {
+        allow_read: Some(allowlist.clone()),
+        allow_write: Some(allowlist),
         ..Default::default()
     });
-    const RUNTIME_JAVASCRIPT_CORE: &str = include_str!("./runtime.js");
-    js_runtime
-        .execute_script("[runjs:runtime.js]", RUNTIME_JAVASCRIPT_CORE)
-        .unwrap();
 
-    let mod_id = js_runtime.load_main_module(&main_module, None).await?;
-    let result = js_runtime.mod_evaluate(mod_id);
-    js_runtime.run_event_loop(false).await?;
-    result.await?
+    let mut worker = create_main_worker(main_module.clone(), permissions);
+    worker.execute_main_module(&main_module).await
 }
 
-fn main() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    if let Err(error) = runtime.block_on(run_js("./example.js")) {
-        eprintln!("error: {}", error);
-    }
+fn create_main_worker(main_module: ModuleSpecifier, permissions: Permissions) -> MainWorker {
+    // WorkerOptions has no default yet, which may change:
+    // https://github.com/denoland/deno/pull/14860
+    let options = WorkerOptions {
+        bootstrap: BootstrapOptions {
+            args: vec![],
+            cpu_count: 1,
+            debug_flag: false,
+            enable_testing_features: false,
+            location: Some(main_module.clone()),
+            no_color: false,
+            is_tty: true,
+            runtime_version: "n/a".to_string(),
+            ts_version: "n/a".to_string(),
+            unstable: false,
+            user_agent: "Deno".to_string(),
+        },
+        extensions: vec![],
+        unsafely_ignore_certificate_errors: None,
+        root_cert_store: None,
+        seed: None,
+        source_map_getter: None,
+        format_js_error_fn: None,
+        web_worker_preload_module_cb: Arc::new(|_| unreachable!()),
+        create_web_worker_cb: Arc::new(|_| unreachable!()),
+        maybe_inspector_server: None,
+        should_break_on_first_statement: false,
+        module_loader: Rc::new(FsModuleLoader),
+        get_error_class_fn: None,
+        origin_storage_dir: None,
+        blob_store: Default::default(),
+        broadcast_channel: Default::default(),
+        shared_array_buffer_store: None,
+        compiled_wasm_module_store: None,
+        stdio: Default::default(),
+    };
+
+    MainWorker::bootstrap_from_options(main_module, permissions, options)
 }
